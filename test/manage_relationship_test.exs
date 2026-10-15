@@ -1564,6 +1564,17 @@ defmodule Ash.Test.ManageRelationshipTest do
                    on_no_match: :error
                  )
         end
+
+        create :create_with_lookup_filter do
+          accept [:title]
+          argument :author, :map, public?: true
+
+          change manage_relationship(:author,
+                  type: :append_and_remove,
+                  on_lookup: {:relate, :create, expr(name == "Allowed")},
+                  on_no_match: :error
+                )
+        end
       end
 
       attributes do
@@ -1573,6 +1584,51 @@ defmodule Ash.Test.ManageRelationshipTest do
 
       relationships do
         belongs_to :author, LookupAuthor, public?: true
+      end
+    end
+
+    defmodule FilteredProduct do
+      @moduledoc false
+      use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
+
+      attributes do
+        uuid_primary_key :id
+        attribute :name, :string, public?: true
+        attribute :published, :boolean, public?: true
+        attribute :filtered_order_id, :uuid
+      end
+
+      actions do
+        defaults [:read, create: :*, update: :*]
+      end
+    end
+
+    defmodule FilteredOrder do
+      @moduledoc false
+      use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
+
+      attributes do
+        uuid_primary_key :id
+        attribute :name, :string, public?: true
+      end
+
+      relationships do
+        has_many :products, FilteredProduct
+      end
+
+      actions do
+        defaults [:read, create: :*]
+
+        update :add_products do
+          require_atomic? false
+          argument :products, {:array, :map}
+
+          change manage_relationship(:products, :products,
+                  type: :append_and_remove,
+                  on_lookup: {:relate, :update, expr(published == true)},
+                  on_no_match: :error
+                )
+        end
       end
     end
 
@@ -1642,6 +1698,42 @@ defmodule Ash.Test.ManageRelationshipTest do
           refute Exception.message(error) =~ "at most one",
                  "match-count oracle leaked via read_one error"
       end
+    end
+
+    test "on_lookup accepts a filter for belongs_to relationships" do
+      author =
+        LookupAuthor
+        |> Ash.Changeset.for_create(:create, %{name: "Allowed"})
+        |> Ash.create!()
+
+      assert {:ok, post} =
+              LookupPost
+              |> Ash.Changeset.for_create(:create_with_lookup_filter, %{
+                title: "Filtered post",
+                author: %{id: author.id}
+              })
+              |> Ash.create()
+
+      assert post.author_id == author.id
+    end
+
+    test "on_lookup accepts a filter for has_many relationships" do
+      product =
+        FilteredProduct
+        |> Ash.Changeset.for_create(:create, %{name: "Published", published: true})
+        |> Ash.create!()
+
+      order =
+        FilteredOrder
+        |> Ash.Changeset.for_create(:create, %{name: "Order"})
+        |> Ash.create!()
+
+      assert {:ok, _order} =
+              order
+              |> Ash.Changeset.for_update(:add_products, %{
+                products: [%{id: product.id}]
+              })
+              |> Ash.update()
     end
   end
 end
