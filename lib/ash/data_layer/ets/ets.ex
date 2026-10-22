@@ -398,8 +398,16 @@ defmodule Ash.DataLayer.Ets do
               {:ok, matches} ->
                 field = field || Enum.at(Ash.Resource.Info.primary_key(resource), 0)
 
-                value = aggregate_value(matches, kind, field, uniq?, include_nil?, default_value)
-                {:cont, {:ok, Map.put(acc, name, value)}}
+                case load_aggregate_field(matches, field, resource, domain, context) do
+                  {:ok, matches} ->
+                    value =
+                      aggregate_value(matches, kind, field, uniq?, include_nil?, default_value)
+
+                    {:cont, {:ok, Map.put(acc, name, value)}}
+
+                  {:error, error} ->
+                    {:halt, {:error, error}}
+                end
 
               {:error, error} ->
                 {:halt, {:error, error}}
@@ -415,6 +423,21 @@ defmodule Ash.DataLayer.Ets do
 
       other ->
         other
+    end
+  end
+
+  # Records come straight from the table, so calculation and aggregate fields
+  # have to be loaded before their values can be aggregated.
+  defp load_aggregate_field(records, field, resource, domain, context) do
+    if is_atom(field) and not is_nil(Ash.Resource.Info.attribute(resource, field)) do
+      {:ok, records}
+    else
+      Ash.load(records, field,
+        domain: domain,
+        tenant: context[:tenant],
+        actor: context[:actor],
+        authorize?: false
+      )
     end
   end
 
@@ -532,6 +555,42 @@ defmodule Ash.DataLayer.Ets do
     end
   end
 
+  defp lateral_join_source(source_query, root_data, source_attribute, domain) do
+    query =
+      source_query.resource
+      |> Ash.Query.new()
+      |> Ash.Query.set_tenant(source_query.tenant)
+      |> Ash.Query.as_of(source_query.as_of)
+      |> Ash.Query.set_context(%{private: %{internal?: true}})
+      |> Ash.Query.set_domain(domain)
+
+    query =
+      case Ash.Resource.Info.primary_key(query.resource) do
+        [] ->
+          source_attributes = Enum.map(root_data, &Map.get(&1, source_attribute))
+
+          Ash.Query.filter(query, ^ref(source_attribute) in ^source_attributes)
+
+        [field] ->
+          source_attributes = Enum.map(root_data, &Map.get(&1, field))
+          Ash.Query.filter(query, ^ref(field) in ^source_attributes)
+
+        fields ->
+          filter = [
+            or:
+              Enum.map(root_data, fn record ->
+                [and: Map.take(record, fields) |> Map.to_list()]
+              end)
+          ]
+
+          Ash.Query.do_filter(query, filter)
+      end
+
+    with {:ok, data_layer_query} <- Ash.Query.data_layer_query(query) do
+      run_query(data_layer_query, query.resource)
+    end
+  end
+
   defp do_limit(records, nil), do: records
   defp do_limit(records, limit), do: Enum.take(records, limit)
 
@@ -547,39 +606,10 @@ defmodule Ash.DataLayer.Ets do
           {source_query, source_attribute, destination_attribute, relationship}
         ]
       ) do
-    source_query =
-      source_query
-      |> Ash.Query.unset(:load)
-      |> Ash.Query.unset(:page)
-      |> Ash.Query.set_context(%{private: %{internal?: true}})
-      |> Ash.Query.set_domain(query.domain)
-
     primary_key = Ash.Resource.Info.primary_key(source_query.resource)
 
-    source_query =
-      case primary_key do
-        [] ->
-          source_attributes = Enum.map(root_data, &Map.get(&1, source_attribute))
-
-          Ash.Query.filter(source_query, ^ref(source_attribute) in ^source_attributes)
-
-        [field] ->
-          source_attributes = Enum.map(root_data, &Map.get(&1, field))
-          Ash.Query.filter(source_query, ^ref(field) in ^source_attributes)
-
-        fields ->
-          filter = [
-            or:
-              Enum.map(root_data, fn record ->
-                [and: Map.take(record, fields) |> Map.to_list()]
-              end)
-          ]
-
-          Ash.Query.do_filter(source_query, filter)
-      end
-
     source_query
-    |> Ash.Actions.Read.unpaginated_read(nil, authorize?: false)
+    |> lateral_join_source(root_data, source_attribute, query.domain)
     |> case do
       {:error, error} ->
         {:error, error}
@@ -631,39 +661,10 @@ defmodule Ash.DataLayer.Ets do
         {through_query, destination_attribute_on_join_resource, destination_attribute,
          _through_relationship}
       ]) do
-    source_query =
-      source_query
-      |> Ash.Query.unset(:load)
-      |> Ash.Query.unset(:page)
-      |> Ash.Query.set_context(%{private: %{internal?: true}})
-      |> Ash.Query.set_domain(query.domain)
-
     primary_key = Ash.Resource.Info.primary_key(source_query.resource)
 
-    source_query =
-      case primary_key do
-        [] ->
-          source_attributes = Enum.map(root_data, &Map.get(&1, source_attribute))
-
-          Ash.Query.filter(source_query, ^ref(source_attribute) in ^source_attributes)
-
-        [field] ->
-          source_attributes = Enum.map(root_data, &Map.get(&1, field))
-          Ash.Query.filter(source_query, ^ref(field) in ^source_attributes)
-
-        fields ->
-          filter = [
-            or:
-              Enum.map(root_data, fn record ->
-                [and: Map.take(record, fields) |> Map.to_list()]
-              end)
-          ]
-
-          Ash.Query.do_filter(source_query, filter)
-      end
-
     source_query
-    |> Ash.read(authorize?: false)
+    |> lateral_join_source(root_data, source_attribute, query.domain)
     |> case do
       {:error, error} ->
         {:error, error}
@@ -2149,7 +2150,7 @@ defmodule Ash.DataLayer.Ets do
   end
 
   defp do_destroy(table, resource, record, tenant, filter, domain, actor, supersede, range?) do
-    pkey = pkey_map(resource, record)
+    pkey = holding_key(table, resource, record, supersede, range?)
 
     if has_filter?(filter) do
       case ETS.Set.get(table, pkey) do
@@ -2168,6 +2169,9 @@ defmodule Ash.DataLayer.Ets do
             {:error, error} ->
               {:error, error}
           end
+
+        {:ok, _} ->
+          {:error, Ash.Error.Changes.StaleRecord.exception(resource: resource, filter: filter)}
 
         {:error, error} ->
           {:error, error}
@@ -2199,6 +2203,10 @@ defmodule Ash.DataLayer.Ets do
     case {supersede, ETS.Set.get(table, pkey)} do
       {{period, %Ash.Range{} = written}, {:ok, {_key, stored}}} when is_map(stored) ->
         close_version(table, pkey, stored, resource, period, written)
+
+      # No version holds the instant, so there is none for it to end.
+      {{period, %Ash.Range{}}, {:ok, _}} ->
+        {:error, Ash.Error.Changes.StaleRecord.exception(resource: resource, field: period)}
 
       _ ->
         with {:ok, _} <- ETS.Set.delete(table, pkey), do: :ok
@@ -2395,11 +2403,11 @@ defmodule Ash.DataLayer.Ets do
   @doc false
   @impl true
   def update(resource, changeset, pkey \\ nil, from_bulk? \\ false) do
-    pkey = pkey || pkey_map(resource, changeset.data)
-
     supersede = supersession(resource, changeset)
+    range? = match?(%Ash.Range{}, changeset.as_of)
 
     with {:ok, table} <- wrap_or_create_table(resource, changeset.tenant, false),
+         pkey = pkey || holding_key(table, resource, changeset.data, supersede, range?),
          _ <- if(!from_bulk?, do: log_update(resource, pkey, changeset)),
          {:ok, record} <-
            do_update(
@@ -2448,6 +2456,37 @@ defmodule Ash.DataLayer.Ets do
       {period, written}
     else
       _ -> nil
+    end
+  end
+
+  # An instant write reaches the version holding its instant, as a SQL layer's `@> as_of`
+  # match does, rather than only the version the caller holds: that one may have been
+  # superseded since it was read. A range reaches the versions it overlaps on its own.
+  defp holding_key(table, resource, record, {period, %Ash.Range{lower: instant}}, false) do
+    pkey = pkey_map(resource, record)
+
+    with false <- holds?(table, pkey, period, instant),
+         {:ok, periods} <- stored_periods(table, resource, record),
+         %Ash.Range{} = holding <-
+           periods
+           |> Map.get(primary_key(resource, record), [])
+           |> Enum.find(&(match?(%Ash.Range{}, &1) and Ash.Range.contains?(&1, instant))) do
+      Map.put(pkey, period, holding)
+    else
+      _ -> pkey
+    end
+  end
+
+  defp holding_key(_table, resource, record, _supersede, _range?), do: pkey_map(resource, record)
+
+  defp holds?(table, pkey, period, instant) do
+    case Map.get(pkey, period) do
+      %Ash.Range{} = held ->
+        Ash.Range.contains?(held, instant) and
+          match?({:ok, {_key, stored}} when is_map(stored), ETS.Set.get(table, pkey))
+
+      _ ->
+        false
     end
   end
 
@@ -2539,7 +2578,7 @@ defmodule Ash.DataLayer.Ets do
           {:ok, _} ->
             {:error,
              Ash.Error.Changes.StaleRecord.exception(
-               resource: record.__struct__,
+               resource: resource,
                filter: changeset_filter
              )}
 

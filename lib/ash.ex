@@ -2649,7 +2649,9 @@ defmodule Ash do
   - `page!/2` for the raising version
   """
   @spec page(Ash.Page.page(), page_request) ::
-          {:ok, Ash.Page.page()} | {:error, Ash.Error.t()}
+          {:ok, Ash.Page.page()}
+          | {:ok, Ash.Page.page(), Ash.Query.t()}
+          | {:error, Ash.Error.t() | String.t()}
   def page(%Ash.Page.Keyset{results: []} = page, :next) do
     {:ok, page}
   end
@@ -2878,7 +2880,8 @@ defmodule Ash do
           query :: load_statement(),
           opts :: Keyword.t()
         ) ::
-          {:ok, Ash.Resource.Record.t() | [Ash.Resource.Record.t()] | nil} | {:error, term}
+          {:ok, Ash.Resource.Record.t() | [Ash.Resource.Record.t()] | :ok | nil}
+          | {:error, term}
 
   @doc spark_opts: [{2, @load_opts_schema}]
   def load(data, query, opts \\ [])
@@ -3214,7 +3217,9 @@ defmodule Ash do
   #{Spark.Options.docs(Ash.Page.Keyset.page_opts())}
   """
   @spec read(Ash.Query.t() | Ash.Resource.t(), Keyword.t()) ::
-          {:ok, list(Ash.Resource.Record.t()) | Ash.Page.page()} | {:error, term}
+          {:ok, list(Ash.Resource.Record.t()) | Ash.Page.page()}
+          | {:ok, list(Ash.Resource.Record.t()) | Ash.Page.page(), Ash.Query.t()}
+          | {:error, term}
   @doc read: [{1, @read_opts_schema}]
   def read(query, opts \\ []) do
     Ash.Helpers.expect_resource_or_query!(query)
@@ -3378,7 +3383,9 @@ defmodule Ash do
   """
   @doc spark_opts: [{1, @read_one_opts_schema}]
   @spec read_one(resource_or_query :: Ash.Query.t() | Ash.Resource.t(), opts :: Keyword.t()) ::
-          {:ok, Ash.Resource.Record.t() | nil} | {:error, Ash.Error.t()}
+          {:ok, Ash.Resource.Record.t() | nil}
+          | {:ok, Ash.Resource.Record.t() | nil, Ash.Query.t()}
+          | {:error, Ash.Error.t()}
   def read_one(query, opts \\ []) do
     Ash.Helpers.expect_options!(opts)
     Ash.Helpers.expect_resource_or_query!(query)
@@ -3457,7 +3464,9 @@ defmodule Ash do
   #{Spark.Options.docs(@read_one_opts_schema)}
   """
   @spec read_first(resource_or_query :: Ash.Query.t() | Ash.Resource.t(), opts :: Keyword.t()) ::
-          {:ok, Ash.Resource.Record.t() | nil} | {:error, Ash.Error.t()}
+          {:ok, Ash.Resource.Record.t() | nil}
+          | {:ok, Ash.Resource.Record.t() | nil, Ash.Query.t()}
+          | {:error, Ash.Error.t()}
   @doc spark_opts: [{1, @read_one_opts_schema}]
   def read_first(query, opts \\ []) do
     Ash.Helpers.expect_options!(opts)
@@ -4215,7 +4224,6 @@ defmodule Ash do
 
     checked = check_as_of_option(changeset, opts)
     opts = Keyword.put_new(opts, :tenant, Map.get(changeset.data.__metadata__, :tenant))
-    opts = Keyword.put_new(opts, :as_of, Map.get(changeset.data.__metadata__, :as_of))
 
     with :ok <- checked,
          {:ok, opts} <- UpdateOpts.validate(opts),
@@ -4243,12 +4251,6 @@ defmodule Ash do
     opts =
       case Map.fetch(record.__metadata__, :tenant) do
         {:ok, tenant} when not is_nil(tenant) -> Keyword.put_new(opts, :tenant, tenant)
-        _ -> opts
-      end
-
-    opts =
-      case Map.fetch(record.__metadata__, :as_of) do
-        {:ok, as_of} when not is_nil(as_of) -> Keyword.put_new(opts, :as_of, as_of)
         _ -> opts
       end
 
@@ -4361,12 +4363,6 @@ defmodule Ash do
     opts =
       case Map.fetch(data.__metadata__, :tenant) do
         {:ok, tenant} when not is_nil(tenant) -> Keyword.put_new(opts, :tenant, tenant)
-        _ -> opts
-      end
-
-    opts =
-      case Map.fetch(data.__metadata__, :as_of) do
-        {:ok, as_of} when not is_nil(as_of) -> Keyword.put_new(opts, :as_of, as_of)
         _ -> opts
       end
 
